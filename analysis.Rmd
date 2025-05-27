@@ -1,0 +1,423 @@
+--
+title: "Drosophila microbiome analysis"
+output: html_notebook
+---
+
+Load the one required libary: DADA2. I took this analysis mostly from the DADA2 
+documentation, with a couple of changes to make it all work for us.
+
+```{r}
+library(dada2)
+library(tidyverse)
+```
+
+Set data directory, and import forward and reverse reads. Our forward reads
+are named _R1_001, our reverse reads R2_001.
+
+```{r}
+path = 'demux'
+
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq.gz",
+                        full.names = TRUE))
+
+fnRs <- sort(list.files(path, pattern = "_R2_001.fastq.gz",
+             full.names = TRUE))
+
+```
+
+Get the sample names from each file. Read in all the names, split at the _, 
+then take the first index (R weirdly starts counting at 1, not 0!) to get 
+our unique sample names.
+
+```{r}
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+```
+
+Visualise quality of the forward reads. There's no need to visualise them
+all, just a few of them should do. We then just cut where the quality starts
+to deteriorate. I'm just visualising two here for quickness of loading, but
+I did look at a few more, and they all look pretty similar.
+
+```{r}
+plotQualityProfile(fnFs[1:2])
+```
+
+The quality seems to drop below a quality score of 30 at about 260bp. We could
+probably therefore snip off all the reads after that point.
+
+
+And of the reverse reads
+```{r}
+plotQualityProfile(fnRs[1:2])
+```
+The quality again seems to drop at about 250bp.
+
+We have primer sequences still on the raw reads, so we need to 
+remove these. Our primers are set out in `sample-metadata.tsv` file. We can 
+read this file in, and automatically calculate the length of the primers.
+
+```{r}
+metadata <- read_tsv("sample-metadata.tsv", show_col_types = FALSE)
+
+checkAllSeqsEqual <- function(data) {
+  return(length(unique(sapply(data, nchar)))==1)
+}
+
+# Check all the forward and reverse primers are the same, then grab the length of the first one
+if (checkAllSeqsEqual(metadata["LinkerPrimerSequence"]) & 
+    checkAllSeqsEqual(metadata["ReversePrimer"])) {
+  
+      print("All samples use same primers")
+  
+      fwd_primer_length <- nchar(metadata[1, "LinkerPrimerSequence"])
+      rev_primer_length <- nchar(metadata[1, "ReversePrimer"])
+      
+      sprintf("fwd_primer length %s, rev_primer length %s", fwd_primer_length, 
+              rev_primer_length)
+} else {
+    print("SAMPLES USE PRIMERS OF INCONSISTENT LENGTHS")
+}
+
+```
+
+
+
+Filter, assign names.
+
+```{r}
+filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+names(filtFs) <- sample.names
+names(filtRs) <- sample.names
+```
+
+Now we trim the final reads. The truncation length used is what we calculated
+earlier from the quality profile plots. We also trim the left of sequences to 
+remove the primers.
+
+```{r}
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(260,250),
+              maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+              compress=TRUE, trimLeft = c(fwd_primer_length, rev_primer_length), 
+              multithread=FALSE) # On Windows set multithread=FALSE
+head(out)
+```
+
+We now try to learn the error rates of the sequences, to remove the errors later.
+
+```{r}
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+plotErrors(errF, nominalQ=TRUE)
+```
+
+These look pretty much as they should, we are good to move on.
+
+Now, sample inference, the main part of the DADA algorithm!
+
+```{r}
+dadaFs <- dada(filtFs, err=errF, multithread=TRUE)
+dadaRs <- dada(filtRs, err=errR, multithread=TRUE)
+dadaFs[[1]]
+
+```
+
+Merge the paired reads together.
+
+```{r}
+mergers <- mergePairs(dadaFs, filtFs, dadaRs, filtRs, verbose = TRUE)
+head(mergers[[1]])
+```
+
+It looks like most of our reads are merging together, so we didn't trim
+too much in the previous steps.
+
+
+Make a sequence table. This is like an OTU table, but the DADA version.
+
+```{r}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+```
+Look at the distribution of sequence lengths.
+
+```{r}
+table(nchar(getSequences(seqtab)))
+```
+We have 1903 different sequence variants. There's quite a lot of variation
+in length between the different variants. I'm not sure where this variation
+comes from - it might be from the blank, therefore representing nonspecific 
+amplification.
+
+Remove chimeras. These are PCR artifacts of sort.
+
+```{r}
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus",
+                                    multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+
+sum(seqtab.nochim)/sum(seqtab)
+
+```
+Of total unique sequences put in, a large proportion are chimeras. However,
+only about 9% of total reads, which is acceptable.
+
+Inspect how many reads made it through each step in the pipeline. 
+```{r}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN),
+               sapply(dadaRs, getN),
+               sapply(mergers, getN),
+               rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls:
+# e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR",
+                     "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+
+```
+This seems good. Apart from filtering, we're not losing a large number of reads
+at any one stage. This suggests nothing too weird is going on here.
+
+Assign taxomonoy
+
+```{r}
+taxa <- assignTaxonomy(seqtab.nochim,
+                       "./tax/silva_nr99_v138.1_wSpecies_train_set.fa.gz",
+                       multithread=TRUE)
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+
+```
+
+Now we have all this data, we use phyloseq to process it further. 
+
+```{r}
+library(phyloseq); packageVersion("phyloseq")
+library(Biostrings); packageVersion("Biostrings")
+library(ggplot2); packageVersion("ggplot2")
+library("ape")
+library(ggpubr)
+```
+
+Here, I pull out the replicate numbers and the condition.
+
+```{r}
+samples.out <- rownames(seqtab.nochim)
+
+Replicate <- sapply(strsplit(samples.out, "\\."), `[`, 2)
+Condition <- sapply(strsplit(samples.out, "\\."), `[`, 1)
+sample_metadata <- data.frame(condition = Condition, replicate = Replicate)
+rownames(sample_metadata) <- samples.out
+```
+
+Make a phyloseq object
+
+```{r}
+ps <- phyloseq(otu_table(seqtab.nochim, taxa_are_rows=FALSE), 
+               sample_data(sample_metadata), 
+               tax_table(taxa))
+ps <- prune_samples(sample_names(ps) != "blank", ps) # Remove blank sample
+dna <- Biostrings::DNAStringSet(taxa_names(ps))
+names(dna) <- taxa_names(ps)
+ps <- merge_phyloseq(ps, dna)
+taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
+ps
+
+```
+
+
+We plot the diversity. Phyloseq will give us a warning, but we can ignore this, 
+as Shannon isn't totally reliant on singletons.
+```{r}
+## Plot alpha-diversity
+plot_richness(ps, x="condition",
+              measures=c("Shannon", "Simpson"), color="condition")
+```
+
+
+
+```{r}
+# Transform data to proportions as appropriate for Bray-Curtis distances
+ps.prop <- transform_sample_counts(ps, function(otu) otu/sum(otu))
+ord.nmds.bray <- ordinate(ps.prop, method="NMDS", distance="bray")
+
+plot_ordination(ps.prop, ord.nmds.bray, color="condition", title="Bray NMDS")
+```
+
+Now we do a clustering. This seems a bit mixed - you can clearly see there's
+a cluster of Ari/DMSO/Cs - and within that Ari and DMSO seem fairly clustered.
+Then you can see a cluster of the mex driven lines, although within that
+it's hard to discern the knockdown from the empty vector.
+
+Let's just look at the Cs type flies - ari, DMSO, and Cs:
+
+```{r}
+ps.ari.dmso <- ps %>% 
+  subset_samples(condition %in% c("Ari", "DMSO"))
+
+ps.prop.cs <- transform_sample_counts(ps.ari.dmso, function(otu) otu/sum(otu))
+ord.nmds.bray.cs <- ordinate(ps.prop.cs, method="NMDS", distance="bray")
+
+plot_ordination(ps.prop.cs, ord.nmds.bray.cs, color="condition", title="Bray NMDS")
+
+
+```
+
+We can actually take this a lot further, and also look at the OTUs on the 
+graph as well. Let's go back to the original graph, with all the data on it.
+
+```{r}
+taxa_plot <- plot_ordination(ps.prop, ord.nmds.bray, type = "taxa", color="Phylum", title="Taxa")
+
+taxa_plot + facet_wrap(~Phylum)
+
+samples_plot <- plot_ordination(ps.prop, ord.nmds.bray, color="condition", title="Bray NMDS")
+
+plot_ordination(ps.prop, ord.nmds.bray, type="biplot", color="condition", shape="Phylum")
+
+```
+This is a bit of a mess and not particularly helpful though, so I think we can
+leave this here.
+
+Now we can do a taxonomic profile. This is probably the most interesting bit
+
+
+```{r}
+## Taxonomic profile
+ps <- subset_taxa(ps, Genus!="Wolbachia")
+
+
+top20 <- names(sort(taxa_sums(ps), decreasing=TRUE))
+ps.top20 <- transform_sample_counts(ps, function(OTU) OTU/sum(OTU))
+ps.top20 <- prune_taxa(top20, ps.top20)
+plot_bar(ps.top20, x="replicate", fill="Family")  + 
+  facet_wrap(~condition, scales="free_x")
+
+
+plot_bar(ps.top20, fill = "Family") + 
+  geom_bar(aes(color=Family, fill=Family), stat="identity", position="stack") + facet_wrap(~condition, scales="free_x") +
+  theme_classic()+
+  theme(legend.text = element_text(size = 15)) +
+  scale_x_discrete(labels = NULL, breaks=NULL)
+```
+It seems like we generally should be considering our samples as replicates,
+rather than merging anyone together. Let's just look at the Ari/DMSO using the
+phyloseq object we made earlier.
+
+```{r}
+top20 <- names(sort(taxa_sums(ps.ari.dmso), decreasing=TRUE))[1:40]
+ps.top20 <- transform_sample_counts(ps.ari.dmso, function(OTU) OTU/sum(OTU))
+ps.top20 <- prune_taxa(top20, ps.top20)
+plot_bar(ps.top20, x="replicate", fill="Family")  + 
+  facet_wrap(~condition, scales="free_x")
+
+```
+
+Another measure we can use to look is richness using an index.
+
+
+```{r}
+richness = estimate_richness(ps)
+
+richness$condition = sapply(strsplit(rownames(richness), "\\."), `[`, 1)
+
+richness %>% 
+  filter(condition == "DMSO" | condition == "Ari") %>% 
+  ggplot(aes(condition, Simpson)) +
+  geom_pointrange(stat="summary",
+                  fun.data = "mean_se") +
+  theme_classic() +
+  geom_point(alpha = 1/2) +
+  stat_compare_means(method="t.test")
+
+with(richness, t.test(Shannon[condition == "DMSO"], Shannon[condition == "Ari"]))
+ggsave("cs_young_and_old_shannon.png")
+
+```
+
+We're looking at Drosophila data here. Really, there are only two Families that
+actually matter now - LAB and AAB. So, let's make a function which will just grab
+these families.
+
+```{r}
+acetoLactoTable <- function (ps_obj) {
+  
+  # First get the OTU table and the taxonomy table
+  otus <- as_tibble(as.data.frame(otu_table(ps_obj)))
+  taxas <- as_tibble(as.data.frame(tax_table(ps_obj)))
+
+  # Add the ASV names to the taxonomy table
+  taxas$asv = rownames(tax_table(ps_obj))
+  
+  # Select the species of interest
+  
+  acetos <- taxas %>% 
+    filter(Family == "Acetobacteraceae")
+    
+  lactos <- taxas %>% 
+    filter(Family == "Lactobacillaceae")
+  
+  # Now calculate the total of each species, and the grand total
+  
+  aceto_totals <- otus %>% 
+    select(acetos$asv) %>% 
+    rowSums()
+  
+  lacto_totals <- otus %>% 
+    select(lactos$asv) %>% 
+    rowSums()
+  
+  grand_totals <- otus %>% 
+    rowSums()
+  
+
+  return(tibble(condition = sapply(strsplit(rownames(otu_table(ps_obj)), "\\."), `[`, 1), 
+     aceto_total = aceto_totals,
+     lacto_total = lacto_totals,
+     other_total = (grand_totals - (aceto_totals + lacto_totals)),
+     aceto_proportion = aceto_totals/grand_totals, 
+     lacto_proportion = lacto_totals/grand_totals,
+     other_proportion = (grand_totals - (aceto_totals + lacto_totals)) / grand_totals,
+     aceto_lacto_ratio = aceto_proportion/lacto_proportion))
+  
+}
+```
+
+
+
+
+```{r}
+# Now we call the function on the ps.ari.dmso table
+
+al_table <- acetoLactoTable(ps.ari.dmso)
+
+al_table %>% 
+  ggplot() +
+  geom_violin(aes(condition, aceto_lacto_ratio))
+
+```
+
+```{r}
+top20 <- names(sort(taxa_sums(ps.ari.dmso), decreasing=TRUE))
+ps.top20 <- transform_sample_counts(ps.ari.dmso, function(OTU) OTU/sum(OTU))
+ps.top20 <- prune_taxa(top20, ps.top20)
+plot_bar(ps.top20, x="replicate", fill="Family")  + 
+  facet_wrap(~condition, scales="free_x")
+
+```
+
+
+
+Now time to export the raw data so we can make charts in prism!
+
+```{r}
+
+write_csv(al_table, file = "ari_dmso_aceto_lacto_ratios.csv")
+write_csv(acetoLactoTable(ps), "ps_aceto_lacto_ratios.csv")
+write_csv(as.data.frame(otu_table(ps)), file = "OTU_table.csv")
+write_csv(as.data.frame(tax_table(ps)), file = "tax_table.csv")
+write_csv(richness, file="diversity_indicies.csv")
+```
